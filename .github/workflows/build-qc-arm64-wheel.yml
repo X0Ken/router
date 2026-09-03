@@ -17,7 +17,10 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Install build frontend
-        run: /opt/python/cp39-cp39/bin/python -m pip install maturin==1.9.4
+        run: |
+          /opt/python/cp39-cp39/bin/python -m pip install maturin==1.9.4
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build manylinux ARM64 wheel
         run: >-

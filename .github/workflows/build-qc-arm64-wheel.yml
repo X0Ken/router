@@ -18,6 +18,7 @@ jobs:
 
       - name: Install build frontend
         run: |
+          dnf install -y openssl-devel pkgconfig
           /opt/python/cp39-cp39/bin/python -m pip install maturin==1.9.4
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"

@@ -18,26 +18,32 @@ jobs:
 
       - name: Install build frontend
         run: |
-          dnf install -y openssl-devel pkgconfig
-          /opt/python/cp39-cp39/bin/python -m pip install maturin==1.9.4
+          dnf install -y openssl-devel pkgconfig protobuf-compiler protobuf-devel
+          /opt/python/cp39-cp39/bin/python -m pip install -U pip setuptools wheel setuptools-rust build auditwheel
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Build manylinux ARM64 wheel
-        run: >-
-          /opt/python/cp39-cp39/bin/maturin build
-          --release
-          --interpreter /opt/python/cp39-cp39/bin/python
-          --compatibility manylinux_2_28
-          --out dist
+        run: |
+          /opt/python/cp39-cp39/bin/python -m build --wheel
+          mkdir -p wheelhouse
+          /opt/python/cp39-cp39/bin/auditwheel repair dist/*.whl -w wheelhouse
+
+      - name: Smoke test wheel contents
+        run: |
+          unzip -l wheelhouse/*.whl | grep -q 'vllm_router/launch_router.py'
+          unzip -l wheelhouse/*.whl | grep -q 'vllm_router_rs.abi3.so'
+          rm -rf /tmp/qc-wheel-test
+          /opt/python/cp39-cp39/bin/python -m pip install --no-deps --target /tmp/qc-wheel-test wheelhouse/*.whl
+          PYTHONPATH=/tmp/qc-wheel-test /opt/python/cp39-cp39/bin/python -c 'import vllm_router, vllm_router_rs; print(vllm_router.__version__)'
 
       - name: Record checksums
-        run: sha256sum dist/*.whl
+        run: sha256sum wheelhouse/*.whl
 
       - name: Upload wheel
         uses: actions/upload-artifact@v4
         with:
           name: vllm-router-qc-fix-arm64
-          path: dist/*.whl
+          path: wheelhouse/*.whl
           if-no-files-found: error
           retention-days: 7

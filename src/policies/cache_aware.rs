@@ -243,10 +243,13 @@ impl LoadBalancingPolicy for CacheAwarePolicy {
         let model_id = normalize_model_key(workers[healthy_indices[0]].model_id());
 
         // Get current load statistics - compute min/max in single pass without allocation
-        let (min_load, max_load) = workers.iter().fold((usize::MAX, 0usize), |(min, max), w| {
-            let load = w.load();
-            (min.min(load), max.max(load))
-        });
+        let (min_load, max_load) =
+            healthy_indices
+                .iter()
+                .fold((usize::MAX, 0usize), |(min, max), &idx| {
+                    let load = workers[idx].load();
+                    (min.min(load), max.max(load))
+                });
         let min_load = if min_load == usize::MAX { 0 } else { min_load };
 
         // Check if load is imbalanced
@@ -540,6 +543,47 @@ mod tests {
             let idx = policy.select_worker(&workers, Some("test")).unwrap();
             assert_eq!(idx, 1); // Should always pick worker2
         }
+    }
+
+    #[test]
+    fn test_unhealthy_worker_load_does_not_force_rebalancing() {
+        let policy = CacheAwarePolicy::with_config(CacheAwareConfig {
+            cache_threshold: 0.5,
+            balance_abs_threshold: 5,
+            balance_rel_threshold: 2.0,
+            eviction_interval_secs: 0,
+            max_tree_size: 10000,
+        });
+
+        let worker1 = BasicWorker::new("http://w1:8000".to_string(), WorkerType::Regular);
+        let worker2 = BasicWorker::new("http://w2:8000".to_string(), WorkerType::Regular);
+        let unhealthy = BasicWorker::new("http://w3:8000".to_string(), WorkerType::Regular);
+        unhealthy.set_healthy(false);
+
+        let workers: Vec<Arc<dyn Worker>> =
+            vec![Arc::new(worker1), Arc::new(worker2), Arc::new(unhealthy)];
+        policy.init_workers(&workers);
+
+        // Establish cache affinity for worker 1 while healthy loads are equal.
+        assert_eq!(
+            policy.select_worker(&workers, Some("cached prompt")),
+            Some(0)
+        );
+        for _ in 0..3 {
+            workers[0].increment_load();
+        }
+        for _ in 0..2 {
+            workers[1].increment_load();
+        }
+        for _ in 0..100 {
+            workers[2].increment_load();
+        }
+
+        // The unhealthy worker's stale load must not force shortest-queue mode.
+        assert_eq!(
+            policy.select_worker(&workers, Some("cached prompt")),
+            Some(0)
+        );
     }
 
     #[test]

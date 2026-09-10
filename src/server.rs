@@ -198,6 +198,19 @@ async fn v1_models(State(state): State<Arc<AppState>>, req: Request) -> Response
         return response;
     }
 
+    if let Some(name) = &state.context.router_config.served_model_name {
+        return Json(json!({
+            "object": "list",
+            "data": [{
+                "id": name,
+                "object": "model",
+                "created": 0,
+                "owned_by": "vllm"
+            }]
+        }))
+        .into_response();
+    }
+
     state.router.get_models(req).await
 }
 

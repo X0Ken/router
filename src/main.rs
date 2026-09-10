@@ -94,6 +94,9 @@ Examples:
 
 "#)]
 struct CliArgs {
+    /// Advertise one model locally at /v1/models without querying workers
+    #[arg(long)]
+    served_model_name: Option<String>,
     /// Host address to bind the router server
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -501,6 +504,7 @@ impl CliArgs {
 
         // Build RouterConfig
         Ok(RouterConfig {
+            served_model_name: self.served_model_name.clone(),
             mode,
             policy,
             connection_mode,

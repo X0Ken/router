@@ -31,6 +31,7 @@ pub enum PolicyType {
 #[pyclass]
 #[derive(Debug, Clone, PartialEq)]
 struct Router {
+    served_model_name: Option<String>,
     host: String,
     port: u16,
     worker_urls: Vec<String>,
@@ -176,6 +177,7 @@ impl Router {
         };
 
         Ok(config::RouterConfig {
+            served_model_name: self.served_model_name.clone(),
             mode,
             policy,
             host: self.host.clone(),
@@ -310,6 +312,7 @@ impl Router {
         otlp_traces_endpoint = None,
         // KV connector default (PD disaggregation)
         kv_connector = String::from("nixl"),
+        served_model_name = None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -372,8 +375,10 @@ impl Router {
         enable_trace: bool,
         otlp_traces_endpoint: Option<String>,
         kv_connector: String,
+        served_model_name: Option<String>,
     ) -> PyResult<Self> {
         Ok(Router {
+            served_model_name,
             host,
             port,
             worker_urls,

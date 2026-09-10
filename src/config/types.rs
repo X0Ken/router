@@ -6,6 +6,9 @@ use std::collections::HashMap;
 /// Main router configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouterConfig {
+    /// Single model advertised locally by /v1/models (None proxies to workers).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_model_name: Option<String>,
     /// Routing mode configuration
     pub mode: RoutingMode,
     /// Worker connection mode
@@ -445,6 +448,7 @@ impl Default for TraceConfig {
 impl Default for RouterConfig {
     fn default() -> Self {
         Self {
+            served_model_name: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![],
             },
@@ -1000,6 +1004,7 @@ mod tests {
     #[test]
     fn test_full_pd_mode_config() {
         let config = RouterConfig {
+            served_model_name: None,
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls: vec![
                     ("http://prefill1:8000".to_string(), Some(8001)),
@@ -1068,6 +1073,7 @@ mod tests {
         selector.insert("app".to_string(), "vllm".to_string());
 
         let config = RouterConfig {
+            served_model_name: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec![
                     "http://worker1:8000".to_string(),
@@ -1135,6 +1141,7 @@ mod tests {
         selectors.insert("version".to_string(), "v1".to_string());
 
         let config = RouterConfig {
+            served_model_name: None,
             mode: RoutingMode::Regular {
                 worker_urls: vec!["http://worker1".to_string()],
             },

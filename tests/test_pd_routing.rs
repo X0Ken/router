@@ -98,6 +98,7 @@ mod test_pd_routing {
 
         for (mode, policy) in test_cases {
             let config = RouterConfig {
+                served_model_name: None,
                 mode,
                 policy,
                 host: "127.0.0.1".to_string(),

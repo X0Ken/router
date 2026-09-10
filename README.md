@@ -125,6 +125,35 @@ cargo run --release -- \
 
 ## Configuration
 
+### Fixed model list for a single-model pool
+
+Use `--served-model-name` to serve `/v1/models` directly from the router:
+
+```bash
+vllm-router --served-model-name dsv4 \
+    --worker-urls http://worker1:8000 http://worker2:8000
+```
+
+The Rust CLI, Python CLI and Python `Router(served_model_name="dsv4", ...)`
+constructor support this option. JSON/YAML configuration uses `served_model_name`.
+After the existing authentication check, `/v1/models` returns:
+
+```json
+{"object":"list","data":[{"id":"dsv4","object":"model","created":0,"owned_by":"vllm"}]}
+```
+
+This response does not contact any workers and stays available when workers are
+unhealthy or removed. It advertises the configured model, not inference readiness;
+use health checks and real generation requests to assess availability. `created: 0`
+indicates that a model creation timestamp is not configured. Backend-specific
+metadata such as context length and LoRA lists is not inferred.
+
+The name must be non-empty without surrounding whitespace or control characters.
+This option cannot be combined with `--enable-igw`. It does not rewrite generation
+requests or change worker selection: configure the same served model name on all
+workers in the pool. Omitting the option preserves the existing backend-proxied
+model-list behavior.
+
 ### Authentication
 
 Enable bearer-token validation by listing validation URLs (comma-separated) in `.env` via `API_KEY_VALIDATION_URLS` or passing `--api-key-validation-urls`.

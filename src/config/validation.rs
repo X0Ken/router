@@ -6,6 +6,18 @@ pub struct ConfigValidator;
 impl ConfigValidator {
     /// Validate a complete router configuration
     pub fn validate(config: &RouterConfig) -> ConfigResult<()> {
+        if let Some(name) = &config.served_model_name {
+            if name.trim().is_empty() || name.trim() != name || name.chars().any(char::is_control) {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "served_model_name must be non-empty, without surrounding whitespace or control characters".to_string(),
+                });
+            }
+            if config.enable_igw {
+                return Err(ConfigError::ValidationFailed {
+                    reason: "served_model_name is only supported in single-router mode".to_string(),
+                });
+            }
+        }
         // Check if service discovery is enabled (either via discovery config or vLLM mode)
         let has_service_discovery = config.discovery.as_ref().is_some_and(|d| d.enabled)
             || matches!(

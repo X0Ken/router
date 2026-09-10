@@ -33,6 +33,8 @@ class Router:
             - PolicyType.PowerOfTwo: Select best of two random workers based on load (PD mode only)
         host: Host address to bind the router server. Default: '127.0.0.1'
         port: Port number to bind the router server. Default: 3001
+        served_model_name: Optional model name advertised locally at /v1/models without
+            querying workers. Does not rename models in generation requests. Default: None.
         worker_startup_timeout_secs: Timeout in seconds for worker startup. Default: 300
         worker_startup_check_interval: Interval in seconds between checks for worker initialization. Default: 10
         cache_threshold: Cache threshold (0.0-1.0) for cache-aware routing. Routes to cached worker

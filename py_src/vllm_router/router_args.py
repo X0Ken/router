@@ -12,6 +12,7 @@ class RouterArgs:
     worker_urls: List[str] = dataclasses.field(default_factory=list)
     host: str = "127.0.0.1"
     port: int = 30000
+    served_model_name: Optional[str] = None
 
     # PD-specific configuration
     mini_lb: bool = False
@@ -105,6 +106,13 @@ class RouterArgs:
             exclude_host_port: If True, don't add host and port arguments (used when inheriting from server)
         """
         prefix = "router-" if use_router_prefix else ""
+
+        parser.add_argument(
+            f"--{prefix}served-model-name",
+            type=str,
+            default=RouterArgs.served_model_name,
+            help="Advertise one model locally at /v1/models without querying workers (single-router mode only)",
+        )
 
         # Worker configuration
         if not exclude_host_port:

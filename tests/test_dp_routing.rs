@@ -247,6 +247,7 @@ mod dp_e2e_tests {
     /// Helper to create a RouterConfig with DP settings for Regular mode
     fn make_regular_config(worker_urls: Vec<String>, dp_size: usize) -> RouterConfig {
         RouterConfig {
+            served_model_name: None,
             mode: RoutingMode::Regular { worker_urls },
             policy: PolicyConfig::RoundRobin,
             host: "127.0.0.1".to_string(),
@@ -289,6 +290,7 @@ mod dp_e2e_tests {
         dp_size: usize,
     ) -> RouterConfig {
         RouterConfig {
+            served_model_name: None,
             mode: RoutingMode::VllmPrefillDecode {
                 prefill_urls,
                 decode_urls,

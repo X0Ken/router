@@ -147,12 +147,19 @@ fn test_usage_conversion() {
 }
 
 #[test]
-fn test_reasoning_param_default() {
+fn test_reasoning_param_omitted_effort() {
+    let parsed: ResponseReasoningParam = serde_json::from_str("{}").unwrap();
+    assert!(parsed.effort.is_none());
+    assert_eq!(
+        serde_json::to_value(&parsed).unwrap(),
+        serde_json::json!({})
+    );
+
     let param = ResponseReasoningParam {
         effort: Some(ReasoningEffort::Medium),
     };
 
-    // Test JSON serialization/deserialization preserves default
+    // Explicit values stay unchanged.
     let json = serde_json::to_string(&param).unwrap();
     let parsed: ResponseReasoningParam = serde_json::from_str(&json).unwrap();
 

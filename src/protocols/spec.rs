@@ -841,12 +841,8 @@ pub enum ResponseToolType {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ResponseReasoningParam {
-    #[serde(default = "default_reasoning_effort")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort: Option<ReasoningEffort>,
-}
-
-fn default_reasoning_effort() -> Option<ReasoningEffort> {
-    Some(ReasoningEffort::Medium)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

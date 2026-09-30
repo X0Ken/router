@@ -1193,7 +1193,7 @@ mod tests {
             assert!(request.reasoning_effort.is_none());
             assert!(request.validate().is_ok());
 
-            // Valid reasoning_effort values: Low, Medium, High
+            // Keep known values and forward backend-specific values unchanged.
             request.reasoning_effort = Some(ReasoningEffort::Low);
             assert!(request.validate().is_ok());
 
@@ -1202,6 +1202,24 @@ mod tests {
 
             request.reasoning_effort = Some(ReasoningEffort::High);
             assert!(request.validate().is_ok());
+
+            for value in ["none", "xhigh"] {
+                let request_json = serde_json::json!({
+                    "model": "gpt-4",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "reasoning_effort": value,
+                });
+                let request: ChatCompletionRequest = serde_json::from_value(request_json).unwrap();
+                assert_eq!(
+                    request.reasoning_effort,
+                    Some(ReasoningEffort::Other(value.to_string()))
+                );
+                assert_eq!(
+                    serde_json::to_value(&request).unwrap()["reasoning_effort"],
+                    value
+                );
+                assert!(request.validate().is_ok());
+            }
         }
 
         #[test]

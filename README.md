@@ -302,3 +302,19 @@ The continuous integration pipeline includes comprehensive testing, benchmarking
 ## Acknowledgement
 
 This project is a fork of [SGLang Model Gateway](https://github.com/sgl-project/sglang/tree/main/sgl-model-gateway), and we would like to explicitly acknowledge and thank the original authors for their work. At this stage, our fork includes only minimal changes to preserve the existing interface and ensure compatibility with vLLM. We anticipate further divergence as we pursue the roadmap we have in mind, which is the reason for creating the fork.
+
+### Native regular HTTP forwarding
+
+Regular HTTP inference forwards the original request body bytes and path/query to
+the worker. Chat Completions, Completions, Responses, Messages, Generate, Embeddings,
+and fallback endpoints do not deserialize into a complete API schema or serialize
+a replacement body. Unknown roles, nested extensions, explicit nulls, numeric
+representations, and omitted parameters are left to the backend. Best-effort routing
+hints keep the existing session/prompt selection behavior; unsuccessful hint parsing
+does not reject the request. Worker selection, retries, circuit breakers, authorization,
+and payload limits still apply. Backend status, content type, and response body are
+preserved, and in-flight load is released on EOF or downstream cancellation.
+
+Rerank protocol adapters, disaggregated generation, and other router modes retain
+their existing behavior. This boundary begins at the Router input; a separate auth
+proxy may apply its explicitly configured request policy before forwarding.

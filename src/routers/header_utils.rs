@@ -4,6 +4,42 @@ use axum::http::HeaderMap;
 
 pub use crate::otel_http::TRACE_HEADER_NAMES;
 
+/// Preserve end-to-end header values, including repeated and encoded headers.
+/// Framing and headers nominated by Connection belong to this HTTP hop.
+pub fn proxy_headers(source: &HeaderMap) -> HeaderMap {
+    let connection_headers: Vec<String> = source
+        .get_all("connection")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| {
+            value
+                .split(',')
+                .map(|name| name.trim().to_ascii_lowercase())
+        })
+        .collect();
+    let mut headers = HeaderMap::new();
+    for (name, value) in source {
+        if !matches!(
+            name.as_str(),
+            "connection"
+                | "keep-alive"
+                | "proxy-authenticate"
+                | "proxy-authorization"
+                | "te"
+                | "trailer"
+                | "trailers"
+                | "transfer-encoding"
+                | "upgrade"
+                | "content-length"
+                | "host"
+        ) && !connection_headers.iter().any(|hop| hop == name.as_str())
+        {
+            headers.append(name.clone(), value.clone());
+        }
+    }
+    headers
+}
+
 /// Copy request headers to a Vec of name-value string pairs
 /// Used for forwarding headers to backend workers
 pub fn copy_request_headers(req: &Request<Body>) -> Vec<(String, String)> {

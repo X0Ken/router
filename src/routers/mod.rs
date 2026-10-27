@@ -45,6 +45,21 @@ pub trait WorkerManagement: Send + Sync {
 /// regardless of whether it's a regular router or PD router.
 #[async_trait]
 pub trait RouterTrait: Send + Sync + Debug + WorkerManagement {
+    /// Native regular-HTTP forwarding; other router modes keep their adapters.
+    async fn route_raw(
+        &self,
+        _headers: Option<&HeaderMap>,
+        _path: &str,
+        _method: &Method,
+        _body: bytes::Bytes,
+    ) -> Response {
+        (
+            StatusCode::NOT_IMPLEMENTED,
+            "Raw forwarding is not supported",
+        )
+            .into_response()
+    }
+
     /// Get a reference to self as Any for downcasting
     fn as_any(&self) -> &dyn std::any::Any;
 

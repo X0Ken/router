@@ -17,18 +17,16 @@ use axum::body::to_bytes;
 use axum::{
     body::Body,
     extract::Request,
-    http::{
-        header::CONTENT_LENGTH, header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode,
-    },
+    http::{header::CONTENT_TYPE, HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
 use futures_util::StreamExt;
 use reqwest::Client;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio_stream::wrappers::ReceiverStream;
 use tracing::{debug, error, info, warn};
 
 /// Regular router that uses injected load balancing policies
@@ -569,17 +567,42 @@ impl Router {
         route: &str,
         model_id: Option<&str>,
     ) -> Response {
-        let start = Instant::now();
-        let text = typed_req.extract_text_for_routing();
+        let body = match serde_json::to_vec(typed_req) {
+            Ok(body) => Bytes::from(body),
+            Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
+        };
+        let mut headers = headers.cloned().unwrap_or_default();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        self.route_request(
+            Some(&headers),
+            &body,
+            route,
+            &Method::POST,
+            model_id,
+            &typed_req.extract_text_for_routing(),
+        )
+        .await
+    }
 
+    async fn route_request(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &Bytes,
+        route: &str,
+        method: &Method,
+        model_id: Option<&str>,
+        text: &str,
+    ) -> Response {
+        let start = Instant::now();
+        let metric_route = route.split('?').next().unwrap_or(route);
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
             // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(&text), headers) {
+                let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
                     Some(w) => w,
                     None => {
-                        RouterMetrics::record_request_error(route, "no_available_workers");
+                        RouterMetrics::record_request_error(metric_route, "no_available_workers");
                         return (
                             StatusCode::SERVICE_UNAVAILABLE,
                             "No available workers (all circuits open or unhealthy)",
@@ -602,7 +625,7 @@ impl Router {
                 };
 
                 let response = self
-                    .send_typed_request(headers, typed_req, route, worker.url(), load_guard)
+                    .send_raw_request(headers, body, route, method, worker.url(), load_guard)
                     .await;
 
                 // Client errors (4xx) are not worker failures - only server errors (5xx)
@@ -616,20 +639,20 @@ impl Router {
             |res, _attempt| is_retryable_status(res.status()),
             // on_backoff hook
             |delay, attempt| {
-                RouterMetrics::record_retry(route);
+                RouterMetrics::record_retry(metric_route);
                 RouterMetrics::record_retry_backoff_duration(delay, attempt);
             },
             // on_exhausted hook
-            || RouterMetrics::record_retries_exhausted(route),
+            || RouterMetrics::record_retries_exhausted(metric_route),
         )
         .await;
 
         if response.status().is_success() {
             let duration = start.elapsed();
-            RouterMetrics::record_request(route);
+            RouterMetrics::record_request(metric_route);
             RouterMetrics::record_generate_duration(duration);
         } else if !is_retryable_status(response.status()) {
-            RouterMetrics::record_request_error(route, "non_retryable_error");
+            RouterMetrics::record_request_error(metric_route, "non_retryable_error");
         }
 
         response
@@ -759,168 +782,86 @@ impl Router {
             .await
     }
 
-    // Send typed request directly without conversion
-    async fn send_typed_request<T: GenerationRequest + serde::Serialize>(
+    /// Forward the original body. Metadata never becomes a serialized request.
+    async fn send_raw_request(
         &self,
         headers: Option<&HeaderMap>,
-        typed_req: &T,
+        body: &Bytes,
         route: &str,
+        method: &Method,
         worker_url: &str,
         load_guard: Option<RequestLoadGuard>,
     ) -> Response {
-        let is_stream = typed_req.is_stream();
-        let (mut request_builder, extracted_dp_rank, request_url) =
-            if self.intra_node_data_parallel_size > 1 {
-                let (worker_url_prefix, dp_rank) = match dp_utils::extract_dp_rank(worker_url) {
-                    Ok(tup) => tup,
-                    Err(e) => {
-                        error!("Failed to extract dp_rank: {}", e);
-                        return (
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            format!("Failed to extract dp_rank: {}", e),
-                        )
-                            .into_response();
-                    }
-                };
-
-                // Parse the request body
-                let json_val = match serde_json::to_value(typed_req) {
-                    Ok(j) => j,
-                    Err(e) => {
-                        return (
-                            StatusCode::BAD_REQUEST,
-                            format!("Convert into serde_json::Value failed: {}", e),
-                        )
-                            .into_response();
-                    }
-                };
-
-                // Use the original json_val without modification
-
-                let request_url = format!("{}{}", worker_url_prefix, route);
-                (
-                    self.client.post(&request_url).json(&json_val),
-                    Some(dp_rank),
-                    request_url,
-                )
-            } else {
-                let request_url = format!("{}{}", worker_url, route);
-                (
-                    self.client.post(&request_url).json(typed_req),
-                    None,
-                    request_url,
-                )
-            };
-
-        // Copy all headers from original request if provided, skipping
-        // Content-Type/Content-Length (.json() sets them) and trace headers
-        // (propagate_trace_headers below injects fresh context).
-        if let Some(headers) = headers {
-            for (name, value) in headers {
-                if *name != CONTENT_TYPE
-                    && *name != CONTENT_LENGTH
-                    && !header_utils::TRACE_HEADER_NAMES
-                        .iter()
-                        .any(|&th| name.as_str().eq_ignore_ascii_case(th))
-                {
-                    request_builder = request_builder.header(name, value);
+        let (base_url, dp_rank) = if self.intra_node_data_parallel_size > 1 {
+            match dp_utils::extract_dp_rank(worker_url) {
+                Ok((url, rank)) => (url, Some(rank)),
+                Err(error) => {
+                    return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
                 }
             }
+        } else {
+            (worker_url, None)
+        };
+        let request_url = format!("{}{}", base_url, route);
+        let mut forwarded = headers.map(header_utils::proxy_headers).unwrap_or_default();
+        for name in header_utils::TRACE_HEADER_NAMES {
+            forwarded.remove(*name);
         }
-
-        // Add X-data-parallel-rank header for DP-aware routing
-        if let Some(dp_rank) = extracted_dp_rank {
-            request_builder = request_builder.header("X-data-parallel-rank", dp_rank.to_string());
+        let mut request = self
+            .client
+            .request(method.clone(), &request_url)
+            .headers(forwarded)
+            .body(body.clone());
+        if let Some(rank) = dp_rank {
+            request = request.header("X-data-parallel-rank", rank.to_string());
         }
-
-        let res = match otel_http::send_client_request(
-            request_builder,
+        if let Some(key) = &self.api_key {
+            if headers
+                .and_then(|headers| headers.get("authorization"))
+                .is_none()
+            {
+                request = request.bearer_auth(key);
+            }
+        }
+        let response = match otel_http::send_client_request(
+            request,
             headers,
             ClientRequestOptions {
-                method: "POST",
+                method: method.as_str(),
                 url: &request_url,
-                route: Some(route),
+                route: Some(route.split('?').next().unwrap_or(route)),
                 request_phase: Some("inference"),
             },
         )
         .await
         {
-            Ok(res) => res,
-            Err(e) => {
-                error!(
-                    "Failed to send typed request worker_url={} route={} error={}",
-                    worker_url, route, e
-                );
-
+            Ok(response) => response,
+            Err(error) => {
                 return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("Request failed: {}", e),
+                    StatusCode::BAD_GATEWAY,
+                    format!("Backend request failed: {}", error),
                 )
-                    .into_response();
+                    .into_response()
             }
         };
-
-        let status = StatusCode::from_u16(res.status().as_u16())
-            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-
-        if !is_stream {
-            // For non-streaming requests, preserve headers
-            let response_headers = header_utils::preserve_response_headers(res.headers());
-
-            let response = match res.bytes().await {
-                Ok(body) => {
-                    let mut response = Response::new(axum::body::Body::from(body));
-                    *response.status_mut() = status;
-                    *response.headers_mut() = response_headers;
-                    response
-                }
-                Err(e) => {
-                    let error_msg = format!("Failed to get response body: {}", e);
-                    (StatusCode::INTERNAL_SERVER_ERROR, error_msg).into_response()
-                }
-            };
-
-            response
-        } else {
-            // Preserve headers for streaming response
-            let mut response_headers = header_utils::preserve_response_headers(res.headers());
-            // Ensure we set the correct content-type for SSE
-            response_headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/event-stream"));
-
-            let stream = res.bytes_stream();
-            // Bound buffering so a slow or disconnected client applies
-            // backpressure instead of allowing an unbounded per-request queue.
-            let (tx, rx) = tokio::sync::mpsc::channel(32);
-
-            // Spawn task to forward stream
-            tokio::spawn(async move {
-                // Keep cache-aware load accounted until upstream EOF, error, or
-                // cancellation of this forwarding task.
-                let _load_guard = load_guard;
-                let mut stream = stream;
-                while let Some(chunk) = stream.next().await {
-                    match chunk {
-                        Ok(bytes) => {
-                            if tx.send(Ok(bytes)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(e) => {
-                            let _ = tx.send(Err(format!("Stream error: {}", e))).await;
-                            break;
-                        }
-                    }
-                }
-            });
-
-            let stream = ReceiverStream::new(rx);
-            let body = Body::from_stream(stream);
-
-            let mut response = Response::new(body);
-            *response.status_mut() = status;
-            *response.headers_mut() = response_headers;
-            response
-        }
+        let status = response.status();
+        let response_headers = header_utils::proxy_headers(response.headers());
+        // A lazy stream owns the load guard. Dropping a retry response or a
+        // disconnected downstream also drops the upstream and its load increment.
+        // No forwarding task survives a client which stops reading.
+        let stream = futures_util::stream::unfold(
+            (response.bytes_stream(), load_guard),
+            |(mut upstream, guard)| async move {
+                upstream
+                    .next()
+                    .await
+                    .map(|chunk| (chunk, (upstream, guard)))
+            },
+        );
+        let mut response = Response::new(Body::from_stream(stream));
+        *response.status_mut() = status;
+        *response.headers_mut() = response_headers;
+        response
     }
 
     pub async fn add_worker(&self, worker_url: &str) -> Result<String, String> {
@@ -1318,6 +1259,32 @@ impl WorkerManagement for Router {
 
 #[async_trait]
 impl RouterTrait for Router {
+    async fn route_raw(
+        &self,
+        headers: Option<&HeaderMap>,
+        path: &str,
+        method: &Method,
+        body: Bytes,
+    ) -> Response {
+        let start = Instant::now();
+        let text = crate::protocols::routing_metadata::routing_text(&body, path);
+        let response = self
+            .route_request(headers, &body, path, method, None, &text)
+            .await;
+        if path.split('?').next() == Some("/v1/embeddings") {
+            if response.status().is_success() {
+                RouterMetrics::record_embeddings_request();
+                RouterMetrics::record_embeddings_duration(start.elapsed());
+            } else {
+                RouterMetrics::record_embeddings_error(&format!(
+                    "http_{}",
+                    response.status().as_u16()
+                ));
+            }
+        }
+        response
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -1568,8 +1535,8 @@ impl RouterTrait for Router {
         }
     }
 
-    /// Route a transparent proxy request to a backend worker
-    /// Forwards the request as-is to a selected worker
+    /// Compatibility entry point for callers which already hold a JSON value.
+    /// Native HTTP handlers use route_raw directly and never serialize the body.
     async fn route_transparent(
         &self,
         headers: Option<&HeaderMap>,
@@ -1577,118 +1544,19 @@ impl RouterTrait for Router {
         method: &Method,
         body: serde_json::Value,
     ) -> Response {
-        debug!("Transparent proxy: routing {} {} to backend", method, path);
-
-        // Select a worker (filter by availability like select_worker_for_model)
-        let all_workers = self.worker_registry.get_all();
-        let workers: Vec<Arc<dyn Worker>> = all_workers
-            .iter()
-            .filter(|w| w.is_available())
-            .cloned()
-            .collect();
-        if workers.is_empty() {
-            return (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "No available workers".to_string(),
-            )
-                .into_response();
-        }
-
-        let policy = self.policy_registry.get_default_policy();
-        let request_text = serde_json::to_string(&body).ok();
-        let request_headers = Self::headers_to_request_headers(headers);
-        let worker_idx = match policy.select_worker_with_headers(
-            &workers,
-            request_text.as_deref(),
-            request_headers.as_ref(),
-        ) {
-            Some(idx) => idx,
-            None => {
-                return (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "Failed to select a worker".to_string(),
-                )
-                    .into_response();
+        let body = if body.is_null() {
+            Bytes::new()
+        } else {
+            match serde_json::to_vec(&body) {
+                Ok(body) => Bytes::from(body),
+                Err(error) => return (StatusCode::BAD_REQUEST, error.to_string()).into_response(),
             }
         };
-
-        let worker: &dyn Worker = workers[worker_idx].as_ref();
-        let url = worker.endpoint_url(path);
-
-        debug!("Transparent proxy: forwarding to {}", url);
-
-        // Build the request
-        let mut request_builder = match *method {
-            Method::GET => self.client.get(&url),
-            Method::POST => self.client.post(&url),
-            Method::PUT => self.client.put(&url),
-            Method::DELETE => self.client.delete(&url),
-            Method::PATCH => self.client.patch(&url),
-            Method::HEAD => self.client.head(&url),
-            _ => {
-                return (
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    format!("Method {} not supported", method),
-                )
-                    .into_response();
-            }
-        };
-
-        // Add X-data-parallel-rank header for DP-aware routing
-        request_builder = dp_utils::add_dp_rank_header(request_builder, worker.dp_rank());
-
-        // Add JSON body if not null/empty
-        if !body.is_null() {
-            request_builder = request_builder.json(&body);
+        let mut headers = headers.cloned().unwrap_or_default();
+        if !body.is_empty() {
+            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         }
-
-        // Add authorization if configured
-        if let Some(ref key) = self.api_key {
-            request_builder = request_builder.header("Authorization", format!("Bearer {}", key));
-        }
-
-        // Send request
-        match otel_http::send_client_request(
-            request_builder,
-            headers,
-            ClientRequestOptions {
-                method: method.as_str(),
-                url: &url,
-                route: Some(path),
-                request_phase: Some("inference"),
-            },
-        )
-        .await
-        {
-            Ok(response) => {
-                let status = response.status();
-                let headers = response.headers().clone();
-
-                // Stream the response body
-                let body = Body::from_stream(response.bytes_stream());
-                let mut response_builder = Response::builder().status(status.as_u16());
-
-                for (name, value) in headers.iter() {
-                    if name != "transfer-encoding" && name != "content-length" {
-                        response_builder = response_builder.header(name, value);
-                    }
-                }
-
-                match response_builder.body(body) {
-                    Ok(response) => response,
-                    Err(e) => (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("Failed to build response: {}", e),
-                    )
-                        .into_response(),
-                }
-            }
-            Err(e) => (
-                StatusCode::BAD_GATEWAY,
-                format!("Backend request failed: {}", e),
-            )
-                .into_response(),
-        }
+        self.route_raw(Some(&headers), path, method, body).await
     }
 }
 

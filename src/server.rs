@@ -103,6 +103,9 @@ async fn sink_handler() -> Response {
 /// Transparent proxy handler for unmatched routes
 /// Routes requests through the router's route_transparent method
 async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    if state.router.router_type() == "regular" {
+        return forward_regular_request(State(state), req).await;
+    }
     let headers = req.headers().clone();
 
     // Check authorization
@@ -143,6 +146,39 @@ async fn transparent_proxy_handler(State(state): State<Arc<AppState>>, req: Requ
     state
         .router
         .route_transparent(Some(&headers), &path, &method, body_json)
+        .await
+}
+
+/// Parse only routing hints inside the regular router; keep the wire body intact.
+async fn forward_regular_request(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let (parts, body) = req.into_parts();
+    if let Err(response) = authorize_request(&state, &parts.headers).await {
+        return response;
+    }
+    let body = match axum::body::to_bytes(body, state.context.router_config.max_payload_size).await
+    {
+        Ok(body) => body,
+        Err(error) => {
+            let mut status = StatusCode::BAD_REQUEST;
+            let mut source: Option<&(dyn std::error::Error + 'static)> = Some(&error);
+            while let Some(error) = source {
+                if error.is::<http_body_util::LengthLimitError>() {
+                    status = StatusCode::PAYLOAD_TOO_LARGE;
+                    break;
+                }
+                source = error.source();
+            }
+            return (status, "Failed to read request body").into_response();
+        }
+    };
+    let path = parts
+        .uri
+        .path_and_query()
+        .map(|path| path.as_str())
+        .unwrap_or("/");
+    state
+        .router
+        .route_raw(Some(&parts.headers), path, &parts.method, body)
         .await
 }
 
@@ -731,15 +767,26 @@ pub fn build_app_with_request_tracing(
     enable_request_tracing: bool,
 ) -> Router {
     // Create routes
-    let protected_routes = Router::new()
-        .route("/generate", post(generate))
+    let protected_routes = if app_state.router.router_type() == "regular" {
+        Router::new()
+            .route("/generate", post(forward_regular_request))
+            .route("/v1/chat/completions", post(forward_regular_request))
+            .route("/v1/completions", post(forward_regular_request))
+            .route("/v1/responses", post(forward_regular_request))
+            .route("/v1/messages", post(forward_regular_request))
+            .route("/v1/embeddings", post(forward_regular_request))
+    } else {
+        Router::new()
+            .route("/generate", post(generate))
+            .route("/v1/chat/completions", post(v1_chat_completions))
+            .route("/v1/completions", post(v1_completions))
+            .route("/v1/responses", post(v1_responses))
+            .route("/v1/embeddings", post(v1_embeddings))
+    };
+    let protected_routes = protected_routes
         .route("/inference/v1/generate", post(inference_generate))
-        .route("/v1/chat/completions", post(v1_chat_completions))
-        .route("/v1/completions", post(v1_completions))
         .route("/rerank", post(rerank))
         .route("/v1/rerank", post(v1_rerank))
-        .route("/v1/responses", post(v1_responses))
-        .route("/v1/embeddings", post(v1_embeddings))
         .route("/v1/responses/{response_id}", get(v1_responses_get))
         .route(
             "/v1/responses/{response_id}/cancel",
@@ -869,6 +916,9 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
 
     println!("DEBUG: Creating HTTP client");
     let client = Client::builder()
+        // A proxy returns redirects to its caller instead of rewriting/replaying
+        // inference against a different URL behind the caller's back.
+        .redirect(reqwest::redirect::Policy::none())
         .pool_idle_timeout(Some(Duration::from_secs(50)))
         .pool_max_idle_per_host(500)
         .timeout(Duration::from_secs(config.request_timeout_secs))

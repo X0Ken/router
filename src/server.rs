@@ -1022,10 +1022,15 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         config.router_config.health_check.check_interval_secs
     );
 
-    // Set up concurrency limiter with queue if configured
+    // Regular inference dispatches immediately, including under ingress overload.
+    let queue_size = if router.router_type() == "regular" {
+        0
+    } else {
+        config.router_config.queue_size
+    };
     let (limiter, processor) = middleware::ConcurrencyLimiter::new(
         app_context.rate_limiter.clone(),
-        config.router_config.queue_size,
+        queue_size,
         Duration::from_secs(config.router_config.queue_timeout_secs),
     );
 
@@ -1034,7 +1039,7 @@ pub async fn startup(config: ServerConfig) -> Result<(), Box<dyn std::error::Err
         tokio::spawn(processor.run());
         info!(
             "Started request queue with size: {}, timeout: {}s",
-            config.router_config.queue_size, config.router_config.queue_timeout_secs
+            queue_size, config.router_config.queue_timeout_secs
         );
     }
 

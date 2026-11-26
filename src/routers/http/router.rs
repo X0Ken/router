@@ -29,10 +29,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
+use super::prefill::{forward_until_prefill, PrefillPermit};
+
 /// Regular router that uses injected load balancing policies
 #[derive(Debug)]
 pub struct Router {
     worker_registry: Arc<WorkerRegistry>,
+    prefilling: Arc<parking_lot::Mutex<HashMap<String, usize>>>,
     policy_registry: Arc<PolicyRegistry>,
     client: Client,
     worker_startup_timeout_secs: u64,
@@ -47,7 +50,7 @@ pub struct Router {
 
 /// Owns one cache-aware in-flight load increment.
 ///
-/// Moving the guard into the response-body forwarding task keeps the worker
+/// Moving the guard into the downstream response body keeps the worker
 /// busy for the complete upstream response lifetime. Every early return,
 /// retry, cancellation, and panic releases the increment through `Drop`, so
 /// cleanup code cannot accidentally decrement another request's load.
@@ -191,6 +194,7 @@ impl Router {
         };
 
         Ok(Router {
+            prefilling: Default::default(),
             worker_registry: ctx.worker_registry.clone(),
             policy_registry: ctx.policy_registry.clone(),
             client: ctx.client.clone(),
@@ -531,6 +535,7 @@ impl Router {
         model_id: Option<&str>,
         text: Option<&str>,
         headers: Option<&HeaderMap>,
+        prefilling: Option<&HashMap<String, usize>>,
     ) -> Option<Arc<dyn Worker>> {
         // Get workers for the specified model (O(1) lookup if model_id is provided)
         let workers = match model_id {
@@ -538,11 +543,17 @@ impl Router {
             None => self.worker_registry.get_all(),
         };
 
-        let available: Vec<Arc<dyn Worker>> = workers
+        let mut available: Vec<Arc<dyn Worker>> = workers
             .iter()
             .filter(|w| w.is_available())
             .cloned()
             .collect();
+        if let Some(busy) = prefilling {
+            let pending = |w: &Arc<dyn Worker>| busy.get(w.url()).copied().unwrap_or(0);
+            if let Some(minimum) = available.iter().map(pending).min() {
+                available.retain(|worker| pending(worker) == minimum);
+            }
+        }
         if available.is_empty() {
             return None;
         }
@@ -595,20 +606,38 @@ impl Router {
     ) -> Response {
         let start = Instant::now();
         let metric_route = route.split('?').next().unwrap_or(route);
+        let gate_prefill = *method == Method::POST
+            && matches!(
+                metric_route,
+                "/generate"
+                    | "/inference/v1/generate"
+                    | "/v1/chat/completions"
+                    | "/v1/completions"
+                    | "/v1/responses"
+                    | "/v1/messages"
+            );
         let response = RetryExecutor::execute_response_with_retry(
             &self.retry_config,
-            // operation per attempt
             |_: u32| async {
-                let worker = match self.select_worker_for_model(model_id, Some(text), headers) {
-                    Some(w) => w,
-                    None => {
+                let (worker, prefill_permit) = {
+                    let mut busy = gate_prefill.then(|| self.prefilling.lock());
+                    let Some(worker) = self.select_worker_for_model(
+                        model_id,
+                        Some(text),
+                        headers,
+                        busy.as_deref(),
+                    ) else {
                         RouterMetrics::record_request_error(metric_route, "no_available_workers");
                         return (
                             StatusCode::SERVICE_UNAVAILABLE,
                             "No available workers (all circuits open or unhealthy)",
                         )
                             .into_response();
-                    }
+                    };
+                    let permit = busy.as_mut().map(|busy| {
+                        PrefillPermit::acquire(self.prefilling.clone(), busy, worker.url())
+                    });
+                    (worker, permit)
                 };
 
                 // Optional load tracking for cache-aware policy
@@ -625,7 +654,15 @@ impl Router {
                 };
 
                 let response = self
-                    .send_raw_request(headers, body, route, method, worker.url(), load_guard)
+                    .send_raw_request(
+                        headers,
+                        body,
+                        route,
+                        method,
+                        worker.url(),
+                        load_guard,
+                        prefill_permit,
+                    )
                     .await;
 
                 // Client errors (4xx) are not worker failures - only server errors (5xx)
@@ -783,6 +820,7 @@ impl Router {
     }
 
     /// Forward the original body. Metadata never becomes a serialized request.
+    #[allow(clippy::too_many_arguments)]
     async fn send_raw_request(
         &self,
         headers: Option<&HeaderMap>,
@@ -791,6 +829,7 @@ impl Router {
         method: &Method,
         worker_url: &str,
         load_guard: Option<RequestLoadGuard>,
+        prefill_permit: Option<PrefillPermit>,
     ) -> Response {
         let (base_url, dp_rank) = if self.intra_node_data_parallel_size > 1 {
             match dp_utils::extract_dp_rank(worker_url) {
@@ -823,7 +862,7 @@ impl Router {
                 request = request.bearer_auth(key);
             }
         }
-        let response = match otel_http::send_client_request(
+        let request = otel_http::prepare_client_request(
             request,
             headers,
             ClientRequestOptions {
@@ -832,9 +871,35 @@ impl Router {
                 route: Some(route.split('?').next().unwrap_or(route)),
                 request_phase: Some("inference"),
             },
-        )
-        .await
-        {
+        );
+        let upstream = Self::forward_raw(request);
+        let response = if let Some(permit) = prefill_permit {
+            forward_until_prefill(upstream, permit).await
+        } else {
+            upstream.await
+        };
+
+        if let Some(guard) = load_guard {
+            let (parts, body) = response.into_parts();
+            // Preserve downstream load accounting independently of the
+            // first-token observer, which can outlive the downstream.
+            let stream = futures_util::stream::unfold(
+                (body.into_data_stream(), guard),
+                |(mut upstream, guard)| async move {
+                    upstream
+                        .next()
+                        .await
+                        .map(|chunk| (chunk, (upstream, guard)))
+                },
+            );
+            Response::from_parts(parts, Body::from_stream(stream))
+        } else {
+            response
+        }
+    }
+
+    async fn forward_raw(request: otel_http::PreparedClientRequest) -> Response {
+        let response = match request.send().await {
             Ok(response) => response,
             Err(error) => {
                 return (
@@ -846,19 +911,7 @@ impl Router {
         };
         let status = response.status();
         let response_headers = header_utils::proxy_headers(response.headers());
-        // A lazy stream owns the load guard. Dropping a retry response or a
-        // disconnected downstream also drops the upstream and its load increment.
-        // No forwarding task survives a client which stops reading.
-        let stream = futures_util::stream::unfold(
-            (response.bytes_stream(), load_guard),
-            |(mut upstream, guard)| async move {
-                upstream
-                    .next()
-                    .await
-                    .map(|chunk| (chunk, (upstream, guard)))
-            },
-        );
-        let mut response = Response::new(Body::from_stream(stream));
+        let mut response = Response::new(Body::from_stream(response.bytes_stream()));
         *response.status_mut() = status;
         *response.headers_mut() = response_headers;
         response
@@ -1563,7 +1616,7 @@ impl RouterTrait for Router {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn request_load_guard_releases_exactly_its_own_load() {
@@ -1617,6 +1670,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            prefilling: Default::default(),
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -1628,6 +1682,141 @@ mod tests {
             circuit_breaker_config: CircuitBreakerConfig::default(),
             _worker_loads: Arc::new(rx),
             _load_monitor_handle: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn prefill_admission_four_workers_and_disconnect() {
+        use axum::routing::post;
+        use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+        use tokio_stream::wrappers::ReceiverStream;
+
+        let router = Router {
+            worker_registry: Arc::new(WorkerRegistry::new()),
+            client: Client::builder()
+                .timeout(Duration::from_secs(5))
+                .build()
+                .unwrap(),
+            ..create_test_regular_router()
+        };
+        let (started_tx, mut started_rx) = mpsc::channel(8);
+        let mut servers = Vec::new();
+        let mut urls = Vec::new();
+        for id in 0..4 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            urls.push(url.clone());
+            router
+                .worker_registry
+                .register(Arc::new(BasicWorker::new(url, WorkerType::Regular)));
+            let started_tx = started_tx.clone();
+            let app = axum::Router::new().route(
+                "/v1/chat/completions",
+                post(move || {
+                    let started_tx = started_tx.clone();
+                    async move {
+                        let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(4);
+                        started_tx.send((id, tx)).await.unwrap();
+                        (
+                            [(CONTENT_TYPE, "text/event-stream")],
+                            Body::from_stream(ReceiverStream::new(rx)),
+                        )
+                    }
+                }),
+            );
+            servers.push(tokio::spawn(async move {
+                axum::serve(listener, app).await.unwrap()
+            }));
+        }
+
+        let request = || {
+            router.route_raw(
+                None,
+                "/v1/chat/completions",
+                &Method::POST,
+                Bytes::from_static(br#"{"model":"test","messages":[],"stream":true}"#),
+            )
+        };
+        let next_backend = |rx: &mut mpsc::Receiver<_>| rx.try_recv().unwrap();
+        let mut responses = Vec::new();
+        let mut workers = Vec::new();
+        for _ in 0..4 {
+            let response = request().await;
+            assert_eq!(response.status(), StatusCode::OK);
+            responses.push(response);
+            workers.push(next_backend(&mut started_rx));
+        }
+        assert_eq!(
+            workers
+                .iter()
+                .map(|(id, _)| id)
+                .collect::<HashSet<_>>()
+                .len(),
+            4
+        );
+        // Saturation still dispatches immediately. The backend owns the queue.
+        let queued = timeout(Duration::from_millis(500), request())
+            .await
+            .unwrap();
+        assert_eq!(queued.status(), StatusCode::OK);
+        let (queued_id, queued_tx) = next_backend(&mut started_rx);
+
+        // Disconnect the downstream with two outstanding requests on that
+        // worker. Other workers still have only one each.
+        let disconnected_index = workers.iter().position(|(id, _)| *id == queued_id).unwrap();
+        drop(responses.remove(disconnected_index));
+        workers.swap(0, disconnected_index);
+        workers[0]
+            .1
+            .send(Ok(Bytes::from_static(
+                b"data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\r\n\r\n",
+            )))
+            .await
+            .unwrap();
+        let another = request().await;
+        assert_eq!(another.status(), StatusCode::OK);
+        let (another_id, another_tx) = next_backend(&mut started_rx);
+        assert_ne!(another_id, queued_id);
+        drop(another_tx);
+        to_bytes(another.into_body(), usize::MAX).await.unwrap();
+
+        // Split a real token event across chunks. It releases only its own
+        // permit before EOF, leaving the queued request accounted for.
+        workers[0]
+            .1
+            .send(Ok(Bytes::from_static(b"da")))
+            .await
+            .unwrap();
+        workers[0]
+            .1
+            .send(Ok(Bytes::from_static(
+                b"ta: {\"choices\":[{\"delta\":{\"reasoning_content\":\"x\"}}]}\n\n",
+            )))
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(2), workers[0].1.closed())
+            .await
+            .unwrap();
+        assert_eq!(router.prefilling.lock().get(&urls[queued_id]), Some(&1));
+        drop(queued_tx);
+        to_bytes(queued.into_body(), usize::MAX).await.unwrap();
+        let replacement = request().await;
+        assert_eq!(replacement.status(), StatusCode::OK);
+        let (id, replacement_tx) = next_backend(&mut started_rx);
+        assert_eq!(id, workers[0].0);
+
+        // A backend transport failure before the first token returns the
+        // permit as well. A connected downstream receives the body error.
+        replacement_tx
+            .send(Err(std::io::Error::other("upstream reset")))
+            .await
+            .unwrap();
+        assert!(to_bytes(replacement.into_body(), usize::MAX).await.is_err());
+        assert_eq!(request().await.status(), StatusCode::OK);
+        assert_eq!(next_backend(&mut started_rx).0, id);
+
+        for server in servers {
+            server.abort();
         }
     }
 
@@ -1689,6 +1878,7 @@ mod tests {
 
         let (_, rx) = tokio::sync::watch::channel(HashMap::new());
         Router {
+            prefilling: Default::default(),
             worker_registry,
             policy_registry,
             worker_startup_timeout_secs: 5,
@@ -1750,7 +1940,12 @@ mod tests {
         let mut selected_urls: Vec<String> = Vec::new();
         for _ in 0..10 {
             let worker = router
-                .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), Some(&header_map))
+                .select_worker_for_model(
+                    None,
+                    Some(r#"{"prompt": "test"}"#),
+                    Some(&header_map),
+                    None,
+                )
                 .expect("Should select a worker");
             selected_urls.push(worker.url().to_string());
         }
@@ -1780,7 +1975,7 @@ mod tests {
         }
 
         let worker = router
-            .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None)
+            .select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None, None)
             .expect("Should select the remaining healthy worker");
 
         assert_eq!(
@@ -1801,7 +1996,8 @@ mod tests {
             w.set_healthy(false);
         }
 
-        let result = router.select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None);
+        let result =
+            router.select_worker_for_model(None, Some(r#"{"prompt": "test"}"#), None, None);
         assert!(
             result.is_none(),
             "Should return None when all workers are unavailable"
@@ -1823,6 +2019,7 @@ mod tests {
                 None,
                 Some(r#"{"prompt": "test"}"#),
                 Some(&header_map),
+                None,
             ) {
                 worker_urls_seen.insert(worker.url().to_string());
             }
